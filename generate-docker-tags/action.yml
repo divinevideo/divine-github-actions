@@ -1,0 +1,42 @@
+name: 'Generate Docker Tags'
+description: 'Generate consistent Docker image tags from git context'
+
+inputs:
+  include-latest:
+    description: 'Include latest tag on main branch'
+    required: false
+    default: 'true'
+
+outputs:
+  tags:
+    description: 'Comma-separated list of tags'
+    value: ${{ steps.generate.outputs.tags }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: generate
+      shell: bash
+      run: |
+        TAGS=""
+        SHA_SHORT="${GITHUB_SHA::7}"
+
+        if [[ "$GITHUB_REF" == refs/heads/* ]]; then
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          TAGS="${BRANCH},${SHA_SHORT}"
+          if [[ "$BRANCH" == "main" && "${{ inputs.include-latest }}" == "true" ]]; then
+            TAGS="${TAGS},latest"
+          fi
+        elif [[ "$GITHUB_REF" == refs/pull/* ]]; then
+          PR_NUM="${GITHUB_REF#refs/pull/}"
+          PR_NUM="${PR_NUM%/merge}"
+          TAGS="pr-${PR_NUM},${SHA_SHORT}"
+        elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          TAG="${GITHUB_REF#refs/tags/}"
+          TAGS="${TAG},${SHA_SHORT}"
+        else
+          TAGS="${SHA_SHORT}"
+        fi
+
+        echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+        echo "Generated tags: ${TAGS}"

@@ -1,0 +1,55 @@
+name: 'Push Docker Image to GCP'
+description: 'Authenticate and push Docker image to GCP Artifact Registry'
+
+inputs:
+  image-name:
+    description: 'Local Docker image name with tag (e.g., myapp:local)'
+    required: true
+  registry-image:
+    description: 'Target image name in registry (e.g., myapp)'
+    required: true
+  tags:
+    description: 'Comma-separated tags to push'
+    required: true
+  wif-provider:
+    description: 'Workload Identity Federation provider URL'
+    required: true
+  service-account:
+    description: 'GCP service account email'
+    required: true
+  project-id:
+    description: 'GCP project ID'
+    required: true
+  repository:
+    description: 'Artifact Registry repository name'
+    required: true
+  region:
+    description: 'GCP region'
+    required: false
+    default: 'us-central1'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Authenticate to GCP
+      uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: ${{ inputs.wif-provider }}
+        service_account: ${{ inputs.service-account }}
+
+    - name: Configure Docker for Artifact Registry
+      shell: bash
+      run: gcloud auth configure-docker ${{ inputs.region }}-docker.pkg.dev --quiet
+
+    - name: Tag and push image
+      shell: bash
+      run: |
+        REGISTRY="${{ inputs.region }}-docker.pkg.dev/${{ inputs.project-id }}/${{ inputs.repository }}"
+        IFS=',' read -ra TAG_ARRAY <<< "${{ inputs.tags }}"
+        for tag in "${TAG_ARRAY[@]}"; do
+          echo "Tagging: ${REGISTRY}/${{ inputs.registry-image }}:${tag}"
+          docker tag ${{ inputs.image-name }} "${REGISTRY}/${{ inputs.registry-image }}:${tag}"
+          echo "Pushing: ${REGISTRY}/${{ inputs.registry-image }}:${tag}"
+          docker push "${REGISTRY}/${{ inputs.registry-image }}:${tag}"
+        done
+        echo "Pushed to: ${REGISTRY}/${{ inputs.registry-image }}"
