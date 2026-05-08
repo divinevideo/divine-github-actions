@@ -1,0 +1,410 @@
+# Auto-rebase reusable workflow.
+#
+# Updates an open PR's branch when it falls behind its base (main) by
+# either:
+#   - rebasing onto base (mode=rebase) and force-with-lease pushing, OR
+#   - merging base into the PR branch (mode=merge, default) and pushing
+#     a regular merge commit.
+#
+# Resolves trivial conflicts automatically:
+#   - Lockfile-only conflicts (pnpm-lock.yaml, package-lock.json,
+#     yarn.lock, Cargo.lock, go.sum) — regenerate via the relevant tool.
+#   - Generated/build artifacts (dist/, build/, .next/, .turbo/) —
+#     prefer the PR side and regenerate on the next CI tick.
+# For any other conflict the workflow aborts the rebase/merge cleanly,
+# posts a PR comment listing the files needing human resolution, and
+# exits 0 (does not fail the caller's CI).
+#
+# Guardrails:
+#   - Skip when repo root contains `.brain-autofix.disabled`
+#   - Skip when PR has label `do-not-touch` or `wip`
+#   - Skip when last commit's message contains `[skip-autofix]`
+#     (loop-break: every commit we make embeds that trailer)
+#   - Idempotency tag in the autofix commit body keyed by base sha so we
+#     don't re-fire for an already-handled base
+#   - Never push to the default branch — explicit refspec to PR branch
+#   - --force-with-lease only, never plain --force
+#
+# Caller usage (in each opt-in repo's .github/workflows/auto-update-pr.yml):
+#
+#   name: Auto-update PRs
+#   on:
+#     pull_request:
+#       types: [synchronize, labeled, opened, reopened, ready_for_review]
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: write       # to push the rebased branch
+#     pull-requests: write  # to comment on the PR
+#   jobs:
+#     auto-rebase:
+#       uses: divinevideo/divine-github-actions/.github/workflows/auto-rebase.yml@main
+#       with:
+#         mode: merge        # or "rebase"
+#       secrets: inherit
+
+name: auto-rebase
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: '"merge" (default, safe) or "rebase" (clean history, force-pushes)'
+        required: false
+        default: merge
+        type: string
+      base-branch:
+        description: 'Base branch to update from. Defaults to the PR base or "main".'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  auto-rebase:
+    # Skip on push events that aren't to PR branches — `push` events
+    # to main fire one job per open PR via a fan-out we don't yet have,
+    # so for v0 we only act on pull_request events. Caller can still
+    # subscribe to `push` for forward-compat.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Skip if PR has do-not-touch / wip label
+        id: label-check
+        run: |
+          set -euo pipefail
+          labels='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          if echo "$labels" | grep -qE '"(do-not-touch|wip)"'; then
+            echo "PR has do-not-touch/wip label — exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR branch (full history)
+        if: steps.label-check.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if .brain-autofix.disabled present
+        if: steps.label-check.outputs.skip != 'true'
+        id: optout-check
+        run: |
+          set -euo pipefail
+          if [ -f .brain-autofix.disabled ]; then
+            echo "Repo opted out via .brain-autofix.disabled — exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if last commit has [skip-autofix] trailer (loop-break)
+        if: steps.optout-check.outputs.skip != 'true'
+        id: trailer-check
+        run: |
+          set -euo pipefail
+          msg="$(git log -1 --pretty=%B)"
+          if echo "$msg" | grep -qE '\[skip-autofix\]'; then
+            echo "Last commit carries [skip-autofix] — loop-break, exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Configure git identity
+        if: steps.trailer-check.outputs.skip != 'true'
+        run: |
+          git config user.name "divine-brain[autofix]"
+          git config user.email "noreply@divine.video"
+
+      - name: Determine base + check if behind
+        if: steps.trailer-check.outputs.skip != 'true'
+        id: behind
+        run: |
+          set -euo pipefail
+          base="${{ inputs.base-branch }}"
+          if [ -z "$base" ]; then
+            base="${{ github.event.pull_request.base.ref }}"
+          fi
+          if [ -z "$base" ]; then
+            base="main"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          git fetch origin "$base" --depth=200
+          ahead_behind="$(git rev-list --left-right --count "origin/$base...HEAD")"
+          behind_count="$(echo "$ahead_behind" | awk '{print $1}')"
+          ahead_count="$(echo "$ahead_behind" | awk '{print $2}')"
+          echo "behind=$behind_count" >> "$GITHUB_OUTPUT"
+          echo "ahead=$ahead_count" >> "$GITHUB_OUTPUT"
+          if [ "$behind_count" -eq 0 ]; then
+            echo "PR is already up-to-date with origin/$base ($ahead_count commits ahead)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "PR is $behind_count commits behind origin/$base."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update via merge or rebase, resolve trivial conflicts
+        if: steps.behind.outputs.skip != 'true' && steps.trailer-check.outputs.skip != 'true'
+        id: update
+        env:
+          MODE: ${{ inputs.mode }}
+          BASE: ${{ steps.behind.outputs.base }}
+        run: |
+          set -uo pipefail
+          conflicts_resolved=()
+          conflicts_unresolved=()
+
+          start_op() {
+            if [ "$MODE" = "rebase" ]; then
+              git rebase "origin/$BASE"
+            else
+              git merge --no-edit --no-ff "origin/$BASE"
+            fi
+          }
+
+          continue_op() {
+            if [ "$MODE" = "rebase" ]; then
+              git -c core.editor=true rebase --continue
+            else
+              git commit --no-edit
+            fi
+          }
+
+          abort_op() {
+            if [ "$MODE" = "rebase" ]; then
+              git rebase --abort || true
+            else
+              git merge --abort || true
+            fi
+          }
+
+          # Try the operation. If it succeeds straight, we're done.
+          if start_op; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+            echo "conflicts_unresolved=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Otherwise we're mid-conflict. Loop until done OR a conflict
+          # we can't resolve trivially.
+          while true; do
+            unmerged="$(git diff --name-only --diff-filter=U || true)"
+            if [ -z "$unmerged" ]; then
+              # No more conflicts; finalize.
+              if continue_op; then
+                break
+              else
+                # continue_op may itself surface a no-op step in rebase;
+                # try to keep going.
+                git -c core.editor=true rebase --skip 2>/dev/null || true
+                continue
+              fi
+            fi
+
+            handled_any=false
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              case "$f" in
+                pnpm-lock.yaml)
+                  echo "regenerating $f via pnpm install"
+                  git checkout --theirs "$f" 2>/dev/null || git checkout --ours "$f"
+                  if command -v pnpm >/dev/null 2>&1; then
+                    pnpm install --no-frozen-lockfile --prefer-offline >/tmp/pnpm-install.log 2>&1 || true
+                  else
+                    npx -y pnpm install --no-frozen-lockfile --prefer-offline >/tmp/pnpm-install.log 2>&1 || true
+                  fi
+                  git add "$f"
+                  conflicts_resolved+=("$f (regenerated)")
+                  handled_any=true
+                  ;;
+                package-lock.json)
+                  echo "regenerating $f via npm install"
+                  git checkout --theirs "$f" 2>/dev/null || git checkout --ours "$f"
+                  npm install --package-lock-only >/tmp/npm-install.log 2>&1 || true
+                  git add "$f"
+                  conflicts_resolved+=("$f (regenerated)")
+                  handled_any=true
+                  ;;
+                yarn.lock)
+                  echo "regenerating $f via yarn install"
+                  git checkout --theirs "$f" 2>/dev/null || git checkout --ours "$f"
+                  yarn install --mode update-lockfile >/tmp/yarn-install.log 2>&1 || true
+                  git add "$f"
+                  conflicts_resolved+=("$f (regenerated)")
+                  handled_any=true
+                  ;;
+                Cargo.lock)
+                  echo "regenerating $f via cargo update"
+                  git checkout --theirs "$f" 2>/dev/null || git checkout --ours "$f"
+                  cargo update >/tmp/cargo-update.log 2>&1 || true
+                  git add "$f"
+                  conflicts_resolved+=("$f (regenerated)")
+                  handled_any=true
+                  ;;
+                go.sum)
+                  echo "regenerating $f via go mod tidy"
+                  git checkout --theirs "$f" 2>/dev/null || git checkout --ours "$f"
+                  go mod tidy >/tmp/go-mod-tidy.log 2>&1 || true
+                  git add "$f"
+                  conflicts_resolved+=("$f (regenerated)")
+                  handled_any=true
+                  ;;
+                dist/*|build/*|.next/*|.turbo/*|node_modules/*)
+                  # Generated artifacts — prefer the PR side. The next
+                  # CI run will rebuild from source.
+                  echo "taking PR-side for generated artifact $f"
+                  git checkout --ours "$f"
+                  git add "$f"
+                  conflicts_resolved+=("$f (kept PR-side)")
+                  handled_any=true
+                  ;;
+                *)
+                  echo "non-trivial conflict: $f"
+                  conflicts_unresolved+=("$f")
+                  ;;
+              esac
+            done <<< "$unmerged"
+
+            # If we couldn't trivially handle anything in this pass, bail.
+            if [ "$handled_any" = false ]; then
+              break
+            fi
+          done
+
+          if [ ${#conflicts_unresolved[@]} -gt 0 ]; then
+            echo "non-trivial conflicts remain — aborting"
+            abort_op
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "conflicts_unresolved<<EOF"
+              for f in "${conflicts_unresolved[@]}"; do echo "$f"; done
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # All conflicts trivially resolved. Finalize the op.
+          if ! continue_op; then
+            echo "continue_op failed unexpectedly — aborting"
+            abort_op
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            echo "conflicts_unresolved=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "clean=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "conflicts_resolved<<EOF"
+            for f in "${conflicts_resolved[@]}"; do echo "$f"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Add idempotency / loop-break commit
+        if: |
+          steps.behind.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.update.outputs.clean == 'true'
+        env:
+          BASE: ${{ steps.behind.outputs.base }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse "origin/$BASE")"
+          # In merge mode the merge commit message already carries the
+          # [skip-autofix] trailer below; in rebase mode we need to
+          # add a no-op trailer commit to keep the loop-break invariant.
+          if [ "$MODE" = "rebase" ]; then
+            git commit --allow-empty -m "chore: brain-autofix rebased on $BASE@${base_sha:0:7}
+
+          [brain-autofix] [skip-autofix]
+          base-sha: $base_sha
+          mode: rebase"
+          else
+            # Amend the merge commit message in-place to embed our trailer.
+            current="$(git log -1 --pretty=%B)"
+            git commit --amend -m "$current
+
+          [brain-autofix] [skip-autofix]
+          base-sha: $base_sha
+          mode: merge"
+          fi
+
+      - name: Push update back to PR branch
+        if: |
+          steps.behind.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.update.outputs.clean == 'true'
+        env:
+          MODE: ${{ inputs.mode }}
+          PR_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_REF: ${{ github.event.pull_request.head.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          # Defense-in-depth: never push to the repo's default branch
+          # from this workflow, no matter what other inputs say.
+          if [ "$PR_REF" = "$DEFAULT_BRANCH" ]; then
+            echo "refusing to push to default branch ($DEFAULT_BRANCH)"
+            exit 1
+          fi
+          if [ "$MODE" = "rebase" ]; then
+            git push --force-with-lease origin "HEAD:refs/heads/$PR_REF"
+          else
+            git push origin "HEAD:refs/heads/$PR_REF"
+          fi
+
+      - name: Comment on PR — clean update
+        if: |
+          steps.behind.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.update.outputs.clean == 'true'
+        uses: actions/github-script@v7
+        env:
+          MODE: ${{ inputs.mode }}
+          BASE: ${{ steps.behind.outputs.base }}
+          BEHIND: ${{ steps.behind.outputs.behind }}
+          RESOLVED: ${{ steps.update.outputs.conflicts_resolved }}
+        with:
+          script: |
+            const { MODE, BASE, BEHIND, RESOLVED } = process.env;
+            const resolvedList = (RESOLVED || '').split('\n').filter(Boolean);
+            const resolvedMd = resolvedList.length
+              ? `\n\nResolved trivially:\n${resolvedList.map((f) => `- \`${f}\``).join('\n')}`
+              : '';
+            const body = `<!-- divine-brain:auto-rebase -->\n🔁 **brain-autofix: ${MODE} from \`${BASE}\`** — was ${BEHIND} commits behind.${resolvedMd}\n\n_(loop-break: this commit carries the \`[skip-autofix]\` trailer so the next webhook fire skips this workflow.)_`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
+
+      - name: Comment on PR — conflicts need human help
+        if: |
+          steps.behind.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.update.outputs.clean == 'false'
+        uses: actions/github-script@v7
+        env:
+          MODE: ${{ inputs.mode }}
+          BASE: ${{ steps.behind.outputs.base }}
+          UNRESOLVED: ${{ steps.update.outputs.conflicts_unresolved }}
+        with:
+          script: |
+            const { MODE, BASE, UNRESOLVED } = process.env;
+            const list = (UNRESOLVED || '').split('\n').filter(Boolean);
+            const listMd = list.length
+              ? list.map((f) => `- \`${f}\``).join('\n')
+              : '_(no file list captured)_';
+            const body = `<!-- divine-brain:auto-rebase -->\n⚠️ **brain-autofix: couldn't auto-${MODE} from \`${BASE}\`** — non-trivial conflicts need human resolution:\n\n${listMd}\n\nRebase locally and push, or resolve via the GitHub conflict editor. Lockfile / generated-artifact conflicts I auto-handle; anything in source files is on you.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });

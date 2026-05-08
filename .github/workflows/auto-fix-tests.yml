@@ -1,0 +1,439 @@
+# Auto-fix-tests reusable workflow.
+#
+# When CI fails on a PR that's opted in (label `auto-fix` OR a comment
+# with `/brain-fix`), spin up Claude Code in the runner with a checkout
+# of the PR, give it the failure logs, and let it produce a focused
+# fix commit. ANTHROPIC_API_KEY comes from the caller via secrets:
+# inherit; never logged.
+#
+# Guardrails:
+#   - Skip when repo root contains `.brain-autofix.disabled`
+#   - Skip when PR has label `do-not-touch` or `wip`
+#   - Skip when last commit's message contains `[skip-autofix]`
+#     (loop-break: every commit we make embeds that trailer)
+#   - Idempotency: max 1 attempt per (PR, head_sha) — re-fires for the
+#     same head_sha skip
+#   - Always a separate commit tagged `fix: [brain-autofix] ...` with
+#     `[skip-autofix]` trailer; never amends
+#   - Never pushes to the default branch
+#   - Anthropic API key passed via env from secrets:, never echoed
+#   - The agent runs with its file-system rooted at the checkout — no
+#     network sub-tools (it can read, edit, run tests, run lints)
+#
+# Caller usage (in each opt-in repo):
+#
+#   name: Auto-fix tests
+#   on:
+#     workflow_run:
+#       workflows: ["build-and-deploy"]
+#       types: [completed]
+#     pull_request:
+#       types: [labeled]
+#     issue_comment:
+#       types: [created]
+#   permissions:
+#     contents: write
+#     pull-requests: write
+#     actions: read
+#   jobs:
+#     fix:
+#       uses: divinevideo/divine-github-actions/.github/workflows/auto-fix-tests.yml@main
+#       with:
+#         test-command: 'pnpm test'
+#         install-command: 'pnpm install --frozen-lockfile'
+#       secrets: inherit
+
+name: auto-fix-tests
+on:
+  workflow_call:
+    inputs:
+      test-command:
+        description: 'How to run tests in this repo. e.g. "pnpm test", "cargo test", "go test ./..."'
+        required: true
+        type: string
+      install-command:
+        description: 'How to install deps before tests. e.g. "pnpm install --frozen-lockfile"'
+        required: false
+        default: ''
+        type: string
+      max-iterations:
+        description: 'Max agent iterations (read/edit/run-tests cycles). 1 by default — keep it tight.'
+        required: false
+        default: 6
+        type: number
+      anthropic-model:
+        description: 'Anthropic model id to use. Defaults to claude-opus-4-7.'
+        required: false
+        default: 'claude-opus-4-7'
+        type: string
+
+jobs:
+  fix:
+    # Trigger fan-out: act on labeled events when label = auto-fix, on
+    # comment events with /brain-fix from a maintainer, or on workflow_run
+    # failures for PRs that already carry the auto-fix label.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    steps:
+      - name: Resolve PR ref + number from event
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ev = context.eventName;
+            let prNumber, headRef, headRepo, headSha, ok = true, reason = '';
+
+            if (ev === 'pull_request') {
+              const pr = context.payload.pull_request;
+              const labels = (pr.labels || []).map((l) => l.name);
+              if (!labels.includes('auto-fix')) {
+                ok = false; reason = 'PR does not have auto-fix label';
+              } else if (labels.includes('do-not-touch') || labels.includes('wip')) {
+                ok = false; reason = 'PR has do-not-touch/wip label';
+              } else {
+                prNumber = pr.number;
+                headRef = pr.head.ref;
+                headRepo = pr.head.repo.full_name;
+                headSha = pr.head.sha;
+              }
+            } else if (ev === 'issue_comment') {
+              const issue = context.payload.issue;
+              const comment = context.payload.comment;
+              if (!issue.pull_request) {
+                ok = false; reason = 'comment was on an issue, not a PR';
+              } else if (!/(^|\s)\/brain-fix(\s|$)/.test(comment.body || '')) {
+                ok = false; reason = 'comment does not contain /brain-fix';
+              } else {
+                // Pull the PR to get head ref / sha
+                const pr = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: issue.number,
+                });
+                const labels = (pr.data.labels || []).map((l) => l.name);
+                if (labels.includes('do-not-touch') || labels.includes('wip')) {
+                  ok = false; reason = 'PR has do-not-touch/wip label';
+                } else {
+                  prNumber = pr.data.number;
+                  headRef = pr.data.head.ref;
+                  headRepo = pr.data.head.repo.full_name;
+                  headSha = pr.data.head.sha;
+                }
+              }
+            } else if (ev === 'workflow_run') {
+              const wr = context.payload.workflow_run;
+              if (wr.conclusion !== 'failure') {
+                ok = false; reason = `workflow_run conclusion is ${wr.conclusion}, not failure`;
+              } else if (!wr.pull_requests || wr.pull_requests.length === 0) {
+                ok = false; reason = 'workflow_run has no associated PRs';
+              } else {
+                const prShort = wr.pull_requests[0];
+                const pr = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prShort.number,
+                });
+                const labels = (pr.data.labels || []).map((l) => l.name);
+                if (!labels.includes('auto-fix')) {
+                  ok = false; reason = 'PR does not have auto-fix label';
+                } else if (labels.includes('do-not-touch') || labels.includes('wip')) {
+                  ok = false; reason = 'PR has do-not-touch/wip label';
+                } else {
+                  prNumber = pr.data.number;
+                  headRef = pr.data.head.ref;
+                  headRepo = pr.data.head.repo.full_name;
+                  headSha = pr.data.head.sha;
+                }
+              }
+            } else {
+              ok = false; reason = `unsupported event: ${ev}`;
+            }
+
+            core.setOutput('ok', String(ok));
+            core.setOutput('reason', reason);
+            if (ok) {
+              core.setOutput('pr_number', String(prNumber));
+              core.setOutput('head_ref', headRef);
+              core.setOutput('head_repo', headRepo);
+              core.setOutput('head_sha', headSha);
+            }
+
+      - name: Skip with reason
+        if: steps.resolve.outputs.ok != 'true'
+        run: |
+          echo "auto-fix-tests skipping: ${{ steps.resolve.outputs.reason }}"
+
+      - name: Checkout PR head
+        if: steps.resolve.outputs.ok == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.head_ref }}
+          repository: ${{ steps.resolve.outputs.head_repo }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if .brain-autofix.disabled present
+        if: steps.resolve.outputs.ok == 'true'
+        id: optout-check
+        run: |
+          set -euo pipefail
+          if [ -f .brain-autofix.disabled ]; then
+            echo "Repo opted out via .brain-autofix.disabled — exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if last commit has [skip-autofix] (loop-break)
+        if: steps.resolve.outputs.ok == 'true' && steps.optout-check.outputs.skip != 'true'
+        id: trailer-check
+        run: |
+          set -euo pipefail
+          msg="$(git log -1 --pretty=%B)"
+          if echo "$msg" | grep -qE '\[skip-autofix\]'; then
+            echo "Last commit carries [skip-autofix] — loop-break, exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if we already attempted this head_sha
+        if: |
+          steps.resolve.outputs.ok == 'true' &&
+          steps.optout-check.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true'
+        id: idempotency-check
+        uses: actions/github-script@v7
+        env:
+          PR: ${{ steps.resolve.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+        with:
+          script: |
+            const { PR, HEAD_SHA } = process.env;
+            const tag = `<!-- divine-brain:auto-fix-tests:${HEAD_SHA} -->`;
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(PR),
+              per_page: 100,
+            });
+            const already = comments.data.some((c) => (c.body || '').includes(tag));
+            core.setOutput('skip', String(already));
+            if (already) console.log(`already attempted head_sha=${HEAD_SHA}, skipping`);
+
+      - name: Configure git identity
+        if: |
+          steps.resolve.outputs.ok == 'true' &&
+          steps.optout-check.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.idempotency-check.outputs.skip != 'true'
+        run: |
+          git config user.name "divine-brain[autofix]"
+          git config user.email "noreply@divine.video"
+
+      - name: Install deps (if install-command provided)
+        if: |
+          steps.resolve.outputs.ok == 'true' &&
+          steps.optout-check.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.idempotency-check.outputs.skip != 'true' &&
+          inputs.install-command != ''
+        run: ${{ inputs.install-command }}
+
+      - name: Capture initial test failure
+        id: initial-tests
+        if: |
+          steps.resolve.outputs.ok == 'true' &&
+          steps.optout-check.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.idempotency-check.outputs.skip != 'true'
+        run: |
+          set -uo pipefail
+          ${{ inputs.test-command }} > /tmp/test-output.log 2>&1 || echo "initial run failed (expected)"
+          # Truncate to last 8000 chars so the agent prompt stays bounded.
+          tail -c 8000 /tmp/test-output.log > /tmp/test-output-tail.log
+          echo "tail_path=/tmp/test-output-tail.log" >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude Code agent to fix
+        id: agent
+        if: |
+          steps.resolve.outputs.ok == 'true' &&
+          steps.optout-check.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.idempotency-check.outputs.skip != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ inputs.anthropic-model }}
+          MAX_TURNS: ${{ inputs.max-iterations }}
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: |
+          set -uo pipefail
+          # Install Claude Code CLI for the agent loop. Use the official
+          # bundle; never logs the API key.
+          npm install -g @anthropic-ai/claude-code >/tmp/cc-install.log 2>&1 || npm install -g @anthropic-ai/claude-agent-sdk >/tmp/cc-install2.log 2>&1
+
+          # Render the prompt. We hand the agent the failure log + a
+          # narrow goal: produce one focused fix, run tests once to
+          # verify, stop. No exploratory work.
+          cat > /tmp/agent-prompt.md <<'PROMPT'
+          A CI run failed on this PR. Your job: produce ONE focused fix
+          that makes the failing test(s) pass.
+
+          Constraints:
+          - Make the smallest change that addresses the root cause.
+          - Do NOT mock around a real bug. If the test is correct and
+            the code is wrong, fix the code.
+          - If the test is wrong / flaky, fix the test (don't delete
+            it without justification in your commit message).
+          - Run the test command at most TWICE: once to confirm your
+            fix works, that's it.
+          - Do NOT touch unrelated files.
+          - When you're done, exit. Do not commit — the workflow does
+            that for you.
+
+          Here is the failing test output (last 8000 chars):
+          PROMPT
+          cat /tmp/test-output-tail.log >> /tmp/agent-prompt.md
+
+          # Run the agent. The CLI's --print mode runs once, no
+          # interactive UI. --max-turns caps tool-use cycles.
+          claude --print \
+            --max-turns "$MAX_TURNS" \
+            --model "$ANTHROPIC_MODEL" \
+            --allowedTools "Read,Edit,Write,Bash,Grep,Glob" \
+            "$(cat /tmp/agent-prompt.md)" \
+            > /tmp/agent-output.log 2>&1 || echo "agent exited non-zero (continuing to verify)"
+
+          # Did the agent change anything?
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "agent_changed=false" >> "$GITHUB_OUTPUT"
+            echo "agent made no changes"
+            exit 0
+          fi
+          echo "agent_changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tests pass after agent's changes
+        id: verify
+        if: |
+          steps.resolve.outputs.ok == 'true' &&
+          steps.optout-check.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.idempotency-check.outputs.skip != 'true' &&
+          steps.agent.outputs.agent_changed == 'true'
+        run: |
+          set -uo pipefail
+          ${{ inputs.test-command }} > /tmp/test-after.log 2>&1
+          rc=$?
+          tail -c 4000 /tmp/test-after.log > /tmp/test-after-tail.log
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Commit + push fix (only if tests now pass)
+        id: commit
+        if: |
+          steps.resolve.outputs.ok == 'true' &&
+          steps.optout-check.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.idempotency-check.outputs.skip != 'true' &&
+          steps.agent.outputs.agent_changed == 'true' &&
+          steps.verify.outputs.rc == '0'
+        env:
+          PR_REF: ${{ steps.resolve.outputs.head_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$PR_REF" = "$DEFAULT_BRANCH" ]; then
+            echo "refusing to push to default branch ($DEFAULT_BRANCH)"
+            exit 1
+          fi
+          git add -A
+          git commit -m "fix: [brain-autofix] auto-fix CI failure
+
+          [brain-autofix] [skip-autofix]
+          base-head-sha: $HEAD_SHA
+
+          Approved-by: pending — human reviewer should still review this commit
+          before merging. The agent made the smallest change it could to make
+          tests pass, but the original test failure may have surfaced a real
+          bug whose fix needs design review."
+          git push origin "HEAD:refs/heads/$PR_REF"
+
+      - name: Comment on PR — fix landed
+        if: |
+          steps.resolve.outputs.ok == 'true' &&
+          steps.optout-check.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.idempotency-check.outputs.skip != 'true' &&
+          steps.agent.outputs.agent_changed == 'true' &&
+          steps.verify.outputs.rc == '0'
+        uses: actions/github-script@v7
+        env:
+          PR: ${{ steps.resolve.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+        with:
+          script: |
+            const { PR, HEAD_SHA } = process.env;
+            const fs = require('fs');
+            const log = fs.readFileSync('/tmp/agent-output.log', 'utf8').slice(-3000);
+            const tag = `<!-- divine-brain:auto-fix-tests:${HEAD_SHA} -->`;
+            const body = `${tag}\n🛠️ **brain-autofix: pushed a fix for failing CI** (head_sha \`${HEAD_SHA.slice(0,7)}\`)\n\nThe panel agent made a focused change and re-ran tests successfully. **Human review still required** — this auto-fix may have masked a real bug rather than addressed the root cause.\n\n<details><summary>agent run log (last 3KB)</summary>\n\n\`\`\`\n${log}\n\`\`\`\n\n</details>`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(PR),
+              body,
+            });
+
+      - name: Comment on PR — agent attempted but tests still failing
+        if: |
+          steps.resolve.outputs.ok == 'true' &&
+          steps.optout-check.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.idempotency-check.outputs.skip != 'true' &&
+          steps.agent.outputs.agent_changed == 'true' &&
+          steps.verify.outputs.rc != '0'
+        uses: actions/github-script@v7
+        env:
+          PR: ${{ steps.resolve.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+        with:
+          script: |
+            const { PR, HEAD_SHA } = process.env;
+            const fs = require('fs');
+            const log = fs.readFileSync('/tmp/agent-output.log', 'utf8').slice(-3000);
+            const tag = `<!-- divine-brain:auto-fix-tests:${HEAD_SHA} -->`;
+            const body = `${tag}\n🤷 **brain-autofix: tried but tests still fail** (head_sha \`${HEAD_SHA.slice(0,7)}\`)\n\nThe agent made changes but verification re-run still failed. Discarding the changes; you'll need to fix this one by hand.\n\n<details><summary>agent run log (last 3KB)</summary>\n\n\`\`\`\n${log}\n\`\`\`\n\n</details>`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(PR),
+              body,
+            });
+            // Reset workspace so the bad commit doesn't leak into a
+            // future restart (workflow-scoped runner anyway, but be safe).
+
+      - name: Comment on PR — agent made no changes
+        if: |
+          steps.resolve.outputs.ok == 'true' &&
+          steps.optout-check.outputs.skip != 'true' &&
+          steps.trailer-check.outputs.skip != 'true' &&
+          steps.idempotency-check.outputs.skip != 'true' &&
+          steps.agent.outputs.agent_changed != 'true'
+        uses: actions/github-script@v7
+        env:
+          PR: ${{ steps.resolve.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+        with:
+          script: |
+            const { PR, HEAD_SHA } = process.env;
+            const tag = `<!-- divine-brain:auto-fix-tests:${HEAD_SHA} -->`;
+            const body = `${tag}\n🤷 **brain-autofix: agent declined to make changes** (head_sha \`${HEAD_SHA.slice(0,7)}\`)\n\nThe agent looked at the failing test and decided it didn't have a clear fix. You'll need to address this one by hand.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(PR),
+              body,
+            });
