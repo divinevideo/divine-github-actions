@@ -44,6 +44,12 @@
 #       secrets: inherit
 
 name: auto-fix-tests
+# Serialize per (PR, workflow). Two near-simultaneous failures
+# shouldn't run two agents in parallel (they'd both push and the
+# second --force-with-lease would fail anyway).
+concurrency:
+  group: brain-autofix-tests-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: true
 on:
   workflow_call:
     inputs:
@@ -85,6 +91,13 @@ jobs:
           script: |
             const ev = context.eventName;
             let prNumber, headRef, headRepo, headSha, ok = true, reason = '';
+            const baseRepo = `${context.repo.owner}/${context.repo.repo}`;
+
+            // Helper: refuse PRs from forks. We can't push back to a
+            // fork branch with our GITHUB_TOKEN, so any "fix" we make
+            // would be committed locally and then fail to push, leaving
+            // the PR untouched and the agent run wasted. Skip cleanly.
+            const isFork = (full) => full && full !== baseRepo;
 
             if (ev === 'pull_request') {
               const pr = context.payload.pull_request;
@@ -93,6 +106,8 @@ jobs:
                 ok = false; reason = 'PR does not have auto-fix label';
               } else if (labels.includes('do-not-touch') || labels.includes('wip')) {
                 ok = false; reason = 'PR has do-not-touch/wip label';
+              } else if (isFork(pr.head.repo.full_name)) {
+                ok = false; reason = `PR is from a fork (${pr.head.repo.full_name}); cannot push back`;
               } else {
                 prNumber = pr.number;
                 headRef = pr.head.ref;
@@ -116,6 +131,8 @@ jobs:
                 const labels = (pr.data.labels || []).map((l) => l.name);
                 if (labels.includes('do-not-touch') || labels.includes('wip')) {
                   ok = false; reason = 'PR has do-not-touch/wip label';
+                } else if (isFork(pr.data.head.repo.full_name)) {
+                  ok = false; reason = `PR is from a fork (${pr.data.head.repo.full_name}); cannot push back`;
                 } else {
                   prNumber = pr.data.number;
                   headRef = pr.data.head.ref;
@@ -141,6 +158,8 @@ jobs:
                   ok = false; reason = 'PR does not have auto-fix label';
                 } else if (labels.includes('do-not-touch') || labels.includes('wip')) {
                   ok = false; reason = 'PR has do-not-touch/wip label';
+                } else if (isFork(pr.data.head.repo.full_name)) {
+                  ok = false; reason = `PR is from a fork (${pr.data.head.repo.full_name}); cannot push back`;
                 } else {
                   prNumber = pr.data.number;
                   headRef = pr.data.head.ref;

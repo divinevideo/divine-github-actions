@@ -157,6 +157,10 @@ jobs:
     secrets: inherit
 ```
 
+**Note on triggers:** v0 only acts on `pull_request` events. A `push: main` trigger that fanned out across all open PRs would be a useful follow-up but isn't built — don't add `push:` to your caller for now.
+
+**Fork PRs are skipped** automatically. The workflow can't push back to a fork branch using the base repo's `GITHUB_TOKEN`.
+
 **Trivial conflict resolution covers:**
 `pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `Cargo.lock`, `go.sum`
 (regenerated via the relevant package manager), and `dist/`, `build/`,
@@ -197,6 +201,8 @@ jobs:
 
 The caller repo must have `ANTHROPIC_API_KEY` set as a secret (or
 inherited from the org).
+
+**Fork PRs are skipped** — `secrets.GITHUB_TOKEN` can't push to a fork.
 
 ### Guardrails (both workflows)
 
