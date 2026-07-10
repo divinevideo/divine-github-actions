@@ -1,6 +1,6 @@
 # Divine GitHub Actions
 
-Reusable GitHub Actions for DiVine repositories.
+Reusable GitHub Actions for Divine repositories.
 
 ## Actions
 
@@ -220,3 +220,7 @@ inherited from the org).
 ## License
 
 MIT
+
+---
+
+Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)
